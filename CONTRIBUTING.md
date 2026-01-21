@@ -1,6 +1,6 @@
-# Contributing to Hidden State Training Framework
+# Contributing to Interlat
 
-We welcome contributions to the Hidden State Training Framework! This document provides guidelines for contributing to the project.
+We welcome contributions to the Interlat Framework! This document provides guidelines for contributing to the project.
 
 ## 🚀 Getting Started
 
