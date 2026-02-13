@@ -8,6 +8,7 @@ from torch.utils.data import Dataset
 import transformers
 from transformers import PreTrainedTokenizer
 from transformers.trainer_pt_utils import LabelSmoother
+import torch.distributed as dist
 
 from hidden_state_loader import HiddenStateLoader
 
@@ -19,7 +20,8 @@ IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 local_rank = None
 
 def rank0_print(*args):
-    if local_rank == 0:
+    """Print only on rank 0 in distributed training"""
+    if local_rank is None or local_rank == 0:
         print(*args)
 
 def debug_mask_for_conversation(
@@ -370,11 +372,12 @@ def preprocess_with_position_tracking(
     )
 
 class SupervisedDataset(Dataset):
-    """Dataset for supervised fine-tuning with position tracking."""
+    """Dataset for supervised fine-tuning with position tracking (eager loading - not recommended for large datasets)."""
 
     def __init__(self, raw_data, tokenizer: transformers.PreTrainedTokenizer, model_path: str = None):
         super(SupervisedDataset, self).__init__()
 
+        rank0_print("[WARNING] Using SupervisedDataset with eager loading. For large datasets, use LazySupervisedDataset instead.")
         rank0_print("Formatting inputs with position tracking...")
         sources = [example["conversations"] for example in raw_data]
 
@@ -432,50 +435,94 @@ class SupervisedDataset(Dataset):
 
 
 class LazySupervisedDataset(Dataset):
-    """Dataset for supervised fine-tuning with lazy preprocessing and position tracking."""
+    """Dataset for supervised fine-tuning with lazy preprocessing and position tracking.
+    
+    This dataset does NOT cache processed data to avoid memory overflow.
+    Data is processed on-the-fly for each access.
+    
+    Note: In multi-worker DataLoader, each worker will have its own copy of this dataset
+    and the HiddenStateLoader. To avoid memory issues, we defer the creation of
+    HiddenStateLoader to the worker processes.
+    """
 
-    def __init__(self, raw_data, tokenizer: transformers.PreTrainedTokenizer, model_path: str = None):
+    def __init__(self, raw_data, tokenizer: transformers.PreTrainedTokenizer, model_path: str = None, 
+                 hidden_state_loader: HiddenStateLoader = None, prepended_length: int = 800,
+                 hidden_data_path: str = None):
         super(LazySupervisedDataset, self).__init__()
 
-        rank0_print("Formatting inputs... Skipped in lazy mode")
+        rank0_print("Initializing LazySupervisedDataset in lazy mode (no preprocessing, no caching)")
         self.tokenizer = tokenizer
         self.raw_data = raw_data
-        self.cached_data_dict = {}
         self.model_path = model_path
+        self.hidden_state_loader = hidden_state_loader
+        self.prepended_length = prepended_length
+        self.hidden_data_path = hidden_data_path
+        
+        # Worker-local loader (will be initialized in worker processes)
+        self._worker_loader = None
+        
+        rank0_print(f"Dataset initialized with {len(self.raw_data)} examples")
+
+    def _get_loader(self):
+        """Get the HiddenStateLoader.
+        
+        The loader is created once in the main process and shared to workers
+        via fork() copy-on-write. No per-worker loading needed.
+        """
+        if self._worker_loader is None:
+            if self.hidden_state_loader is not None:
+                self._worker_loader = self.hidden_state_loader
+            elif self.hidden_data_path is not None:
+                # Fallback: create loader if not provided (should not happen normally)
+                rank0_print(f"Warning: Creating HiddenStateLoader in worker (fallback)")
+                self._worker_loader = HiddenStateLoader(self.hidden_data_path)
+        return self._worker_loader
 
     def __len__(self):
         return len(self.raw_data)
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        if i in self.cached_data_dict:
-            return self.cached_data_dict[i]
-
-        # Only preprocess conversation data
+        # Process conversation data on-the-fly (no caching)
         ret = preprocess_with_position_tracking(
             [self.raw_data[i]["conversations"]],
             self.tokenizer,
             self.model_path
         )
 
-        # Build return dict, directly reading plan and hidden_state from raw data
+        # Extract plan from raw data
+        plan = self.raw_data[i].get('plan', '')
+        plan_ids = self.tokenizer(plan, add_special_tokens=False).input_ids
+
+        # Build return dict
         result = dict(
             input_ids=ret["input_ids"][0],
             labels=ret["labels"][0],
             attention_mask=ret["attention_mask"][0],
             human_end_positions=ret["human_end_positions"][0],
-            plan=self.tokenizer(self.raw_data[i].get('plan', ''), add_special_tokens=False).input_ids,
+            plan=plan_ids,
         )
 
-        # Add hidden state (directly from raw data)
+        # Load hidden state on-the-fly from raw data or loader
         if 'hidden_state' in self.raw_data[i]:
             hidden_state = self.raw_data[i]['hidden_state']
             if isinstance(hidden_state, torch.Tensor):
                 result['prepended_hidden_states'] = hidden_state
             else:
                 result['prepended_hidden_states'] = torch.tensor(hidden_state, dtype=torch.float32)
+        elif 'id' in self.raw_data[i]:
+            # Load hidden state from loader if available
+            loader = self._get_loader()
+            if loader is not None:
+                try:
+                    hidden_state, _ = loader.get_hidden_state_and_plan(self.raw_data[i]['id'])
+                    hidden_length = hidden_state.shape[0]
+                    if hidden_length >= self.prepended_length:
+                        hidden_state = hidden_state[:self.prepended_length, :]
+                    result['prepended_hidden_states'] = hidden_state
+                except Exception as e:
+                    # If loading fails, skip hidden state for this example
+                    rank0_print(f"Warning: Failed to load hidden state for example {i}: {e}")
 
-        self.cached_data_dict[i] = result
-        print(f"DEBUG: Dataset __getitem__ for index {i} returned keys: {result.keys()}")
         return result
 
 
@@ -530,40 +577,77 @@ def make_supervised_data_module(
         use_position_tracking: bool = True,
         prepended_length=800
 ) -> Dict:
-    """Create dataset and collator for supervised fine-tuning."""
+    """Create dataset and collator for supervised fine-tuning.
+    
+    This function now supports lazy loading to avoid memory overflow.
+    When lazy_preprocess is True, data is processed on-the-fly without caching.
+    
+    Memory optimization strategy:
+    - In lazy mode: HiddenStateLoader is NOT created in main process to avoid
+      copying large data to worker processes. Instead, workers create their own loaders.
+    - In non-lazy mode: All data is loaded upfront (not recommended for large datasets).
+    """
+    
+    # NOTE: Do NOT call dist.barrier() here. When using DeepSpeed launcher,
+    # torch.distributed may not be fully initialized yet at this point.
+    # Data loading is a local operation - no synchronization needed.
+    rank0_print(f"🔧 Starting data loading...")
+    
     dataset_cls = (
         LazySupervisedDataset if data_args.lazy_preprocess else SupervisedDataset
     )
 
     hidden_data = data_args.hidden_data
+    loader_train = None
+    
+    rank0_print("Loading data metadata...")
 
-    loader_train = HiddenStateLoader(hidden_data)
-
-    rank0_print("Loading data...")
-
-    # Handle training data
+    # Handle training data - only modify structure, don't load heavy data
     if data_args.data_path:
         train_json = json.load(open(data_args.data_path, "r"))
-        # train_json = train_json[:50]
-        print(f"data_args.data_path: {data_args.data_path}")
+        if getattr(data_args, 'max_samples', 0) > 0:
+            train_json = train_json[:data_args.max_samples]
+            rank0_print(f"⚡ Quick-test mode: using only {len(train_json)} samples")
+        rank0_print(f"Loaded {len(train_json)} training examples from {data_args.data_path}")
+
+    # Collect needed task_ids so HiddenStateLoader only loads what's needed
+    needed_ids = None
+    max_hs = getattr(data_args, 'max_samples', 0)
+    if max_hs > 0 and data_args.data_path:
+        needed_ids = [item['id'] for item in train_json if 'id' in item]
+        rank0_print(f"Will load hidden states for {len(needed_ids)} task_ids only")
+
+    # Load HiddenStateLoader once in main process.
+    # On Linux, fork() uses copy-on-write so workers share the same memory.
+    rank0_print("Loading HiddenStateLoader in main process (shared via fork COW)...")
+    loader_train = HiddenStateLoader(hidden_data, max_samples=max_hs, task_ids=needed_ids)
+
+    # Modify conversation structure without loading hidden states yet
+    if data_args.data_path:
         for item in train_json:
             merged_value = item['conversations'][0]['value'] + '\n' + item['conversations'][2]['value']
             new_first_entry = {'from': 'human', 'value': merged_value}
             new_first_entry['value'] += '\n' + 'Now, you are given a step-by-step plan to complete this task as follow: '
             item['conversations'][0] = new_first_entry
-
-            hidden_state, plan = loader_train.get_hidden_state_and_plan(item['id'])
-            hidden_length = hidden_state.shape[0]
-            if hidden_length >= prepended_length:
-                hidden_state = hidden_state[:prepended_length, :]
-
-            item['hidden_state'] = hidden_state
-            item['plan'] = plan
+            
+            # For non-lazy mode, load hidden states and plans immediately
+            if not data_args.lazy_preprocess:
+                hidden_state, plan = loader_train.get_hidden_state_and_plan(item['id'])
+                hidden_length = hidden_state.shape[0]
+                if hidden_length >= prepended_length:
+                    hidden_state = hidden_state[:prepended_length, :]
+                item['hidden_state'] = hidden_state
+                item['plan'] = plan
+            else:
+                # For lazy mode, only store metadata (id and plan text)
+                # Hidden states will be loaded in __getitem__ by worker processes
+                if 'id' in item:
+                    pass
 
             # Remove the second entry (original first gpt response)
             del item['conversations'][1:3]
 
-    # === New: split validation set from training set if eval_data_path not provided ===
+    # === Split validation set from training set if eval_data_path not provided ===
     if data_args.eval_data_path is None:
         rng = random.Random(42)
         rng.shuffle(train_json)
@@ -571,13 +655,36 @@ def make_supervised_data_module(
         n_eval = max(1, int(n_total * data_args.eval_ratio))
         eval_json = train_json[:n_eval]
         train_json = train_json[n_eval:]
+        rank0_print(f"Split dataset: {len(train_json)} train, {len(eval_json)} eval")
     else:
         eval_json = json.load(open(data_args.eval_data_path, "r"))
+        rank0_print(f"Loaded {len(eval_json)} eval examples from {data_args.eval_data_path}")
 
-    train_dataset = dataset_cls(train_json, tokenizer=tokenizer, model_path=model_path)
-    eval_dataset = dataset_cls(eval_json, tokenizer=tokenizer, model_path=model_path)
+    # Create datasets with appropriate parameters
+    if data_args.lazy_preprocess:
+        train_dataset = dataset_cls(
+            train_json, 
+            tokenizer=tokenizer, 
+            model_path=model_path, 
+            hidden_state_loader=loader_train,  # Share single loader via fork COW
+            prepended_length=prepended_length,
+            hidden_data_path=None,  # No need, loader already provided
+        )
+        eval_dataset = dataset_cls(
+            eval_json, 
+            tokenizer=tokenizer, 
+            model_path=model_path,
+            hidden_state_loader=loader_train,  # Share single loader via fork COW
+            prepended_length=prepended_length,
+            hidden_data_path=None,  # No need, loader already provided
+        )
+    else:
+        train_dataset = dataset_cls(train_json, tokenizer=tokenizer, model_path=model_path)
+        eval_dataset = dataset_cls(eval_json, tokenizer=tokenizer, model_path=model_path)
 
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    
+    rank0_print("🔧 Data loading complete")
 
     return dict(
         train_dataset=train_dataset,

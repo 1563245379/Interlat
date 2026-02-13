@@ -9,9 +9,10 @@ from datasets import load_dataset, Split
 from tqdm import tqdm
 
 class HiddenStateLoader:
-    def __init__(self, dataset_name):
+    def __init__(self, dataset_name, max_samples=0, task_ids=None):
         self.dataset_name = dataset_name
-        # self.id_to_hidden_state = {}
+        self.max_samples = max_samples
+        self.task_ids = set(task_ids) if task_ids is not None else None
 
         # Automatically load data during initialization
         self._load_data()
@@ -22,70 +23,59 @@ class HiddenStateLoader:
 
         print(f"Loaded {len(self.dataset)} records.")
 
-        def optimized_convert_nested_arrays_with_plan(df):
-            """Optimized nested array conversion (following PyTorch recommendations) + including plan text"""
+        def optimized_nested_convert(nested_array):
+            """Optimized nested array conversion"""
+            try:
+                if isinstance(nested_array, np.ndarray) and nested_array.dtype == object:
+                    list_data = nested_array.tolist()
+                    numpy_array = np.array(list_data, dtype=np.float32)
+                    return torch.from_numpy(numpy_array).to(torch.bfloat16)
+                elif isinstance(nested_array, np.ndarray):
+                    return torch.from_numpy(nested_array.astype(np.float32)).to(torch.bfloat16)
+                elif isinstance(nested_array, list):
+                    numpy_array = np.array(nested_array, dtype=np.float32)
+                    return torch.from_numpy(numpy_array).to(torch.bfloat16)
+                else:
+                    return torch.tensor(nested_array, dtype=torch.bfloat16)
+            except Exception as e:
+                print(f"Conversion failed: {e}")
+                return None
 
-            print(f"Optimized converting {len(df)} nested arrays with plan text...")
-            start_time = time.time()
+        # Directly iterate over the HuggingFace dataset — no pandas intermediate copy
+        self.id_to_data = {}
+        success_count = 0
+        skip_count = 0
 
-            def optimized_nested_convert(nested_array):
-                """Optimized nested array conversion"""
-                try:
-                    # Follow PyTorch recommendation: convert to a single NumPy array first, then to tensor
-                    if isinstance(nested_array, np.ndarray) and nested_array.dtype == object:
-                        # Use numpy.array() to convert list into a single NumPy array
-                        list_data = nested_array.tolist()
-                        numpy_array = np.array(list_data, dtype=np.float32)
-                        return torch.from_numpy(numpy_array).to(torch.bfloat16)
-                    else:
-                        # If not an object array, convert directly
-                        return torch.from_numpy(nested_array.astype(np.float32))
+        total = len(self.dataset)
+        if self.task_ids is not None:
+            print(f"Filtering: only loading {len(self.task_ids)} task_ids out of {total} records")
 
-                except Exception as e:
-                    print(f"Conversion failed: {e}")
-                    return None
-
-            # Vectorized pandas conversion for hidden_state
-            df['tensor_hidden_state'] = df['hidden_state'].apply(optimized_nested_convert)
-
-            # Check conversion results
-            success_mask = df['tensor_hidden_state'].notna()
-            success_count = success_mask.sum()
-
-            print(f"Successfully converted: {success_count}/{len(df)} arrays")
-
-            # Build dictionary containing hidden_state and plan
-            valid_df = df[success_mask]
-
-            # Option 1: create a nested dictionary structure
-            id_to_data = {}
-
-            # Use tqdm to add a progress bar
-            for _, row in tqdm(valid_df.iterrows(), total=len(valid_df), desc="Building id_to_data"):
-                id_to_data[row['task_id']] = {
-                    'hidden_state': row['tensor_hidden_state'],
-                    'plan': row['plan']
+        for row in tqdm(self.dataset, total=total, desc="Building id_to_data"):
+            tid = row['task_id']
+            # Skip if we have a filter and this id is not needed
+            if self.task_ids is not None and tid not in self.task_ids:
+                skip_count += 1
+                continue
+            tensor = optimized_nested_convert(row['hidden_state'])
+            if tensor is not None:
+                self.id_to_data[tid] = {
+                    'hidden_state': tensor,
+                    'plan': row['plan'],
                 }
+                success_count += 1
+                # Early stop if max_samples is set and we have enough
+                if self.max_samples > 0 and success_count >= self.max_samples:
+                    break
 
-            conversion_time = time.time() - start_time
-            print(f"Optimized conversion completed in {conversion_time:.2f} seconds")
+        print(f"Successfully converted: {success_count}/{total} arrays (skipped: {skip_count})")
 
-            # Verify results
-            if id_to_data:
-                sample_key = next(iter(id_to_data))
-                sample_data = id_to_data[sample_key]
-                print(f"Sample tensor shape: {sample_data['hidden_state'].shape}")
-                print(f"Sample tensor dtype: {sample_data['hidden_state'].dtype}")
-                print(f"Sample plan: {sample_data['plan'][:100]}...")  # Show only first 100 characters
-
-            return id_to_data
-
-        # Show a progress bar (as a single overall step)
-        with tqdm(total=1, desc="Converting Dataset to Pandas") as pbar:
-            df = self.dataset.to_pandas()
-            pbar.update(1)
-
-        self.id_to_data = optimized_convert_nested_arrays_with_plan(df)
+        # Verify results
+        if self.id_to_data:
+            sample_key = next(iter(self.id_to_data))
+            sample_data = self.id_to_data[sample_key]
+            print(f"Sample tensor shape: {sample_data['hidden_state'].shape}")
+            print(f"Sample tensor dtype: {sample_data['hidden_state'].dtype}")
+            print(f"Sample plan: {sample_data['plan'][:100]}...")
 
     # Query function is very efficient
     def get_hidden_state_and_plan(self, task_id):

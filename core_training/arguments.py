@@ -58,7 +58,10 @@ class DataArguments:
     eval_data_path: str = field(
         default=None, metadata={"help": "Path to the evaluation data."}
     )
-    lazy_preprocess: bool = False
+    lazy_preprocess: bool = field(
+        default=True,
+        metadata={"help": "Whether to use lazy preprocessing to avoid loading all data into memory. Recommended for large datasets."}
+    )
     eval_ratio: float = field(
         default=0.01,
         metadata={"help": "When eval_data_path is None, take this ratio from train as eval set."}
@@ -67,6 +70,10 @@ class DataArguments:
         # default='your_dataset'
         # default="recommend_gul_mdl/alfword_hidden_state"
         default='pailitao_v100/alfworld_qwen05B_hidden'
+    )
+    max_samples: int = field(
+        default=0,
+        metadata={"help": "Max number of training samples to use. 0 = use all data. Set to e.g. 50 for quick testing."}
     )
 
 
@@ -78,11 +85,11 @@ class TrainingArguments(transformers.TrainingArguments):
     model_max_length: int = field(default=3800)
 
     # DataLoader
-    dataloader_num_workers: int = field(default=8)
+    dataloader_num_workers: int = field(default=4)
     dataloader_pin_memory: bool = field(default=True)
     dataloader_prefetch_factor: int = field(default=2)
     eval_steps: int = field(
-        default=500,
+        default=100,
         metadata={"help": "Run evaluation every X steps."}
     )
     save_steps: int = field(
@@ -94,7 +101,7 @@ class TrainingArguments(transformers.TrainingArguments):
         metadata={"help": "Log every X steps."}
     )
     save_total_limit: int = field(
-        default=20,
+        default=5,
         metadata={"help": "Max number of checkpoints to keep."}
     )
     metric_for_best_model: str = field(

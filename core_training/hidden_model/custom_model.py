@@ -283,20 +283,41 @@ class ModelWithInsertedHiddenState(nn.Module):
         return result
 
     def cross_gpu_negatives(self, prepended_hidden_states):
-        local = [h.detach().cpu() for h in prepended_hidden_states]
+        """Gather negative samples across GPUs for contrastive learning.
+        
+        Uses dist.all_gather_object which is a collective operation - all ranks
+        must call this simultaneously. Includes fallback for non-distributed or
+        error cases to prevent deadlock.
+        """
         if not (dist.is_available() and dist.is_initialized()):
-            return None
+            # Non-distributed: use local shuffled negatives as fallback
+            return self._local_negatives_fallback(prepended_hidden_states)
 
-        all_lists = [None] * dist.get_world_size()
-        dist.all_gather_object(all_lists, local)
-        pool = []
-        for lst in all_lists:
-            pool.extend(lst)
+        try:
+            local = [h.detach().cpu() for h in prepended_hidden_states]
+            all_lists = [None] * dist.get_world_size()
+            dist.all_gather_object(all_lists, local)
+            pool = []
+            for lst in all_lists:
+                pool.extend(lst)
 
+            negs = []
+            for _ in range(len(prepended_hidden_states)):
+                idx = torch.randint(0, len(pool), (1,)).item()
+                negs.append(pool[idx].to(prepended_hidden_states[0].device))
+            return negs
+        except Exception as e:
+            print(f"Warning: cross_gpu_negatives failed ({e}), using local fallback")
+            return self._local_negatives_fallback(prepended_hidden_states)
+    
+    def _local_negatives_fallback(self, prepended_hidden_states):
+        """Generate negative samples from local batch when cross-GPU gather fails."""
         negs = []
-        for _ in range(len(prepended_hidden_states)):
-            idx = torch.randint(0, len(pool), (1,)).item()
-            negs.append(pool[idx].to(prepended_hidden_states[0].device))
+        n = len(prepended_hidden_states)
+        for i in range(n):
+            # Use a random different sample from the same batch
+            idx = (i + random.randint(1, max(1, n - 1))) % n
+            negs.append(prepended_hidden_states[idx].detach().clone())
         return negs
 
     def _forward_with_hidden_states_curriculum(
@@ -323,7 +344,7 @@ class ModelWithInsertedHiddenState(nn.Module):
 
         plan_embeds_list = []
         for plan_item in plan_ids:
-            plan_tensor = torch.tensor(plan_item, device=device)
+            plan_tensor = torch.tensor(plan_item, device=device, dtype=torch.long)
             plan_embeds = self.base_model.get_input_embeddings()(plan_tensor).to(model_dtype)
             plan_embeds = plan_embeds.requires_grad_(True)
             plan_embeds_list.append(plan_embeds)
@@ -455,21 +476,25 @@ class ModelWithInsertedHiddenState(nn.Module):
             labels = torch.nn.utils.rnn.pad_sequence(new_labels, batch_first=True, padding_value=IGNORE_TOKEN_ID)
 
         if attention_mask is not None:
-            attention_mask = attention_mask.to(device=inputs_embeds.device, dtype=torch.float32,
+            attention_mask = attention_mask.to(device=inputs_embeds.device,
                                                non_blocking=True).contiguous()
 
-        outputs = self.base_model(
-            input_ids=None,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            labels=labels,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            **kwargs
-        )
+        # Ensure inputs_embeds are in model dtype (bf16) for FlashAttention compatibility
+        inputs_embeds = inputs_embeds.to(dtype=model_dtype)
+
+        with torch.cuda.amp.autocast(dtype=model_dtype):
+            outputs = self.base_model(
+                input_ids=None,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                **kwargs
+            )
 
         return outputs, attention_mask, labels
 
@@ -531,17 +556,23 @@ class ModelWithInsertedHiddenState(nn.Module):
                 plan_data = self.insert_plan_tokens(
                     input_ids, attention_mask, labels, human_end_positions, plans
                 )
-                plan_outputs = self.base_model(
-                    input_ids=plan_data['input_ids'],
-                    attention_mask=plan_data['attention_mask'],
-                    labels=plan_data['labels'],
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
-                    output_attentions=output_attentions,
-                    output_hidden_states=output_hidden_states,
-                    return_dict=return_dict,
-                    **kwargs
-                )
+                # Manually embed + cast to model_dtype to avoid float32 upcast
+                # that breaks FlashAttention (only supports fp16/bf16)
+                plan_embeds = self.base_model.get_input_embeddings()(plan_data['input_ids'])
+                plan_embeds = plan_embeds.to(dtype=model_dtype)
+                with torch.cuda.amp.autocast(dtype=model_dtype):
+                    plan_outputs = self.base_model(
+                        input_ids=None,
+                        inputs_embeds=plan_embeds,
+                        attention_mask=plan_data['attention_mask'],
+                        labels=plan_data['labels'],
+                        past_key_values=past_key_values,
+                        use_cache=use_cache,
+                        output_attentions=output_attentions,
+                        output_hidden_states=output_hidden_states,
+                        return_dict=return_dict,
+                        **kwargs
+                    )
 
                 attention_mask_p = plan_data['attention_mask']
                 labels_p = plan_data['labels']
@@ -584,15 +615,23 @@ class ModelWithInsertedHiddenState(nn.Module):
         if plan_outputs is not None and human_end_positions is not None:
             ce_loss_only = normal_outputs.loss.detach()
 
+            # Extract logits and immediately free the full output objects
+            plan_logits = plan_outputs.logits
+            del plan_outputs
+            random_logits = random_outputs.logits
+            del random_outputs
+
             plan_similarity_loss = self.calculate_plan_similarity_loss(
-                normal_outputs.logits, plan_outputs.logits,
+                normal_outputs.logits, plan_logits,
                 attention_mask_n, attention_mask_p, labels_n, labels_p
             )
+            del plan_logits  # free plan logits after use
 
             random_contrast_loss = self.calculate_random_contrast_loss(
-                normal_outputs.logits, random_outputs.logits,
+                normal_outputs.logits, random_logits,
                 attention_mask_n, attention_mask_r, labels_n, labels_r
             )
+            del random_logits  # free random logits after use
 
             self.adjust_weights_dynamically(random_contrast_loss, plan_similarity_loss)
 

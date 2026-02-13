@@ -145,7 +145,7 @@ echo "Logs will be saved to: $LOG_FILE"
 CMD_ARGS=(
     --model_name_or_path "$MODEL_NAME"
     --data_path "$DATA_PATH"
-    --hidden_data_path "$HIDDEN_DATA"
+    --hidden_data "$HIDDEN_DATA"
     --output_dir "$OUTPUT_DIR"
     --num_train_epochs "$EPOCHS"
     --per_device_train_batch_size "$BATCH_SIZE"
@@ -194,17 +194,31 @@ if [[ "$DISTRIBUTED" == "true" ]]; then
     # Use torchrun for distributed training
     if [[ -n "$DEEPSPEED_CONFIG" ]]; then
         # DeepSpeed training
-        deepspeed --num_gpus="$NUM_GPUS" \
+        timeout 3600 deepspeed --num_gpus="$NUM_GPUS" \
             core_training/train.py \
             "${CMD_ARGS[@]}" \
-            2>&1 | tee "$LOG_FILE"
+            2>&1 | tee "$LOG_FILE" || {
+                echo "❌ Training failed or timed out. Checking for stuck processes..."
+                bash scripts/kill_gpu_processes.sh
+                exit 1
+            }
     else
-        # Standard distributed training
-        torchrun --nproc_per_node="$NUM_GPUS" \
+        # Standard distributed training with timeout
+        timeout 3600 torchrun --nproc_per_node="$NUM_GPUS" \
             --master_port=12347 \
             core_training/train.py \
             "${CMD_ARGS[@]}" \
-            2>&1 | tee "$LOG_FILE"
+            2>&1 | tee "$LOG_FILE" || {
+                TRAIN_EXIT_CODE=$?
+                if [ $TRAIN_EXIT_CODE -eq 124 ]; then
+                    echo "❌ Training timed out after 1 hour. This may indicate a deadlock."
+                    echo "   Run 'bash scripts/check_distributed.sh' to diagnose issues."
+                    echo "   Run 'bash scripts/kill_gpu_processes.sh' to clean up stuck processes."
+                else
+                    echo "❌ Training failed with exit code $TRAIN_EXIT_CODE"
+                fi
+                exit 1
+            }
     fi
 else
     echo "Running single-GPU training..."

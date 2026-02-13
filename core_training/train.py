@@ -68,6 +68,27 @@ from data_processor import make_supervised_data_module
 
 os.environ["WANDB_DISABLED"] = "true"
 
+# 🔧 Fix Triton cache directory issues for distributed training
+os.environ["TRITON_CACHE_DIR"] = os.path.expanduser("~/.triton")
+os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
+
+# 🔧 Set NCCL environment variables for better distributed training stability
+os.environ["NCCL_DEBUG"] = "INFO"
+os.environ["NCCL_DEBUG_SUBSYS"] = "INIT,NET"
+os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
+os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "0"
+os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+# Set a reasonable NCCL timeout (5 minutes) to avoid infinite hangs
+os.environ["NCCL_TIMEOUT"] = "300"
+# 🔧 Disable PyTorch 2.4+ eager NCCL communicator initialization
+os.environ["TORCH_NCCL_USE_COMM_NONBLOCKING"] = "0"
+# 🔧 Fix NCCL P2P deadlock: GPUs on different PCIe switches cannot do P2P in Docker
+os.environ["NCCL_P2P_DISABLE"] = "1"
+os.environ["NCCL_SHM_DISABLE"] = "0"
+# 🔧 Use network socket transport as fallback
+os.environ.setdefault("NCCL_SOCKET_IFNAME", "eth0,lo")
+os.environ.setdefault("NCCL_IB_DISABLE", "1")
+
 # Optional: if you have a Hugging Face token, you can set it here (not required)
 # os.environ["HF_TOKEN"] = "your_hf_token_here"
 
@@ -81,10 +102,10 @@ seed_value = 42
 np.random.seed(seed_value)
 random.seed(seed_value)
 os.environ['PYTHONHASHSEED'] = str(seed_value)
-
 torch.manual_seed(seed_value)
-torch.cuda.manual_seed(seed_value)
-torch.cuda.manual_seed_all(seed_value)
+# NOTE: torch.cuda.manual_seed / manual_seed_all moved into train()
+# to avoid premature CUDA context creation on all GPUs from all processes,
+# which causes 'CUDA device busy or unavailable' race conditions.
 
 def detect_precision() -> str:
     """
@@ -139,15 +160,102 @@ def trainer_save_model_safe(trainer: transformers.Trainer):
     ):
         trainer.save_model()
 
+def _get_local_rank() -> int:
+    """Determine local_rank from environment or command-line args."""
+    import sys
+    lr = int(os.environ.get("LOCAL_RANK", -1))
+    if lr == -1:
+        for arg in sys.argv:
+            if arg.startswith("--local_rank="):
+                lr = int(arg.split("=")[1])
+                break
+    return lr
+
+
+def _patch_eager_connect():
+    """
+    Monkey-patch PyTorch 2.4+'s ProcessGroupNCCL to disable eager_connect_single_device.
+
+    In Docker containers, the eager NCCL connection causes 'CUDA device busy'
+    errors when multiple processes simultaneously create CUDA contexts.
+    This patch makes eager_connect_single_device a no-op, falling back to
+    lazy connection which is more robust in containerized environments.
+    """
+    try:
+        from torch.distributed import ProcessGroupNCCL
+        if hasattr(ProcessGroupNCCL, 'eager_connect_single_device'):
+            ProcessGroupNCCL.eager_connect_single_device = lambda self, device: None
+            print("[Patch] Disabled ProcessGroupNCCL.eager_connect_single_device")
+            return
+    except (ImportError, AttributeError):
+        pass
+
+    # Fallback: patch at the C++ binding level via distributed_c10d
+    try:
+        import torch.distributed.distributed_c10d as c10d
+        _orig_helper = c10d._new_process_group_helper
+
+        def _patched_helper(*args, **kwargs):
+            pg, store = _orig_helper(*args, **kwargs)
+            # The original would call pg.eager_connect_single_device(device)
+            # after this returns, but we've already patched the method above.
+            # This fallback patches the returned object directly.
+            if hasattr(pg, 'eager_connect_single_device'):
+                pg.eager_connect_single_device = lambda device: None
+            return pg, store
+
+        c10d._new_process_group_helper = _patched_helper
+        print("[Patch] Patched _new_process_group_helper to skip eager connect")
+    except Exception as e:
+        print(f"[Patch] Warning: could not patch eager connect: {e}")
+
+
 def train():
     global local_rank
+
+    # 🔧 Patch out the problematic eager_connect_single_device before anything
+    # triggers distributed initialization (parse_args → TrainingArgs → init_process_group)
+    _patch_eager_connect()
+
+    # Set device for this rank before parse_args triggers _setup_devices.
+    # Stagger CUDA init across ranks to avoid Docker CUDA driver race conditions.
+    lr = _get_local_rank()
+    if lr >= 0 and torch.cuda.is_available():
+        # Each rank waits (rank * 2s) so GPU contexts are created sequentially
+        if lr > 0:
+            time.sleep(lr * 2.0)
+        # Retry set_device with backoff
+        for attempt in range(5):
+            try:
+                torch.cuda.set_device(lr)
+                print(f"[Init] Rank {lr} bound to GPU {lr} ({torch.cuda.get_device_name(lr)})")
+                break
+            except RuntimeError as e:
+                if attempt < 4:
+                    wait = (attempt + 1) * 2
+                    print(f"[Init] Rank {lr} set_device failed (attempt {attempt+1}/5), "
+                          f"retrying in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    raise
 
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments)
     )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    local_rank = getattr(training_args, "local_rank", -1)
+    # Set local_rank from training_args (DeepSpeed/Trainer canonical source)
+    local_rank = training_args.local_rank
+    if local_rank != -1:
+        torch.cuda.set_device(local_rank)
+        rank0_print(f"🔧 Process {local_rank} using GPU {local_rank}")
+
+    # 🔧 Set CUDA seeds AFTER local_rank is determined and device is set
+    # (doing this at module level causes all processes to init all GPUs simultaneously)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed_value)
+        torch.cuda.manual_seed_all(seed_value)
+    
     if local_rank in (-1, 0):
         print("[Before overrides]")
         print("save_total_limit =", training_args.save_total_limit, flush=True)
@@ -308,39 +416,20 @@ def train():
         prepended_length=model_args.prepended_length
     )
 
-    # Safely move model to device
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    def safe_to_device(model, device):
-        print(f"🔧 [Safe Move] Moving model to device {device}...")
-        moved_params = 0
-        for name, module in model.named_modules():
-            for param_name, param in list(module.named_parameters(recurse=False)):
-                if param.device != device:
-                    new_param = torch.nn.Parameter(
-                        param.data.to(device),
-                        requires_grad=param.requires_grad
-                    )
-                    setattr(module, param_name, new_param)
-                    moved_params += 1
-                    if moved_params <= 5:
-                        print(f"  🔧 Moved param: {name}.{param_name}")
-        for module in model.modules():
-            for name, buffer in list(module.named_buffers(recurse=False)):
-                if buffer is not None and buffer.device != device:
-                    module.register_buffer(name, buffer.to(device))
-        print(f"🔧 [Safe Move] Moved {moved_params} parameters to {device}")
-
-    safe_to_device(model, device)
+    # 🔧 Do NOT manually move model to GPU here.
+    # DeepSpeed / HuggingFace Trainer handles device placement automatically.
+    # Manual placement before Trainer init causes NCCL deadlock.
     tokenizer.padding_side = "right"
     model.tokenizer = tokenizer
 
     training_args.save_safetensors = False
     training_args.remove_unused_columns = False
     training_args.per_device_train_batch_size = 2
+    training_args.per_device_eval_batch_size = 1   # eval runs 3 forward passes, needs less batch
+    training_args.gradient_accumulation_steps = 2  # effective batch = 2 * 2 * 4gpus = 16
 
-    print("🔧 Safely converting model to bfloat16...")
-    safe_to_bfloat16(model)
-    print("✅ Model dtype conversion completed, parameter types preserved")
+    # NOTE: Model is already loaded as bfloat16, no need to convert again.
+    # Redundant safe_to_bfloat16 removed to avoid parameter aliasing issues.
 
     # Ensure eval_strategy is consistent with evaluation_strategy
     training_args.evaluation_strategy = "steps"
