@@ -537,6 +537,39 @@ class ModelWithInsertedHiddenState(nn.Module):
         else:
             raise ValueError("Either input_ids or inputs_embeds must be provided")
 
+        # If no hidden states or plans provided, fall through to base_model directly.
+        # This happens when called from compression training (StudentOverTeacher),
+        # where latent insertion is handled externally.
+        if prepended_hidden_states is None and plans is None:
+            with torch.cuda.amp.autocast(dtype=model_dtype):
+                if inputs_embeds is not None:
+                    inputs_embeds = inputs_embeds.to(dtype=model_dtype)
+                    outputs = self.base_model(
+                        input_ids=None,
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                        past_key_values=past_key_values,
+                        use_cache=use_cache,
+                        output_attentions=output_attentions,
+                        output_hidden_states=output_hidden_states,
+                        return_dict=return_dict,
+                        **kwargs
+                    )
+                else:
+                    outputs = self.base_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                        past_key_values=past_key_values,
+                        use_cache=use_cache,
+                        output_attentions=output_attentions,
+                        output_hidden_states=output_hidden_states,
+                        return_dict=return_dict,
+                        **kwargs
+                    )
+            return outputs
+
         hidden_state_seq_len = []
         plan_seq_len = []
         for item in prepended_hidden_states:

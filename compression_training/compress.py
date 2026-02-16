@@ -38,6 +38,7 @@ import os
 import re
 import gc
 import json
+import sys
 import time
 import random
 import argparse
@@ -68,18 +69,37 @@ from transformers.trainer_pt_utils import LabelSmoother
 from fastchat.model.model_adapter import get_model_adapter
 from fastchat.conversation import SeparatorStyle
 
+os.environ["WANDB_DISABLED"] = "true"
+
+# Fix Triton cache directory issues for distributed training
+os.environ["TRITON_CACHE_DIR"] = os.path.expanduser("~/.triton")
+os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
+
+# NCCL environment variables for distributed training stability
+os.environ["NCCL_DEBUG"] = "INFO"
+os.environ["NCCL_DEBUG_SUBSYS"] = "INIT,NET"
+os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
+os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "0"
+os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+os.environ["NCCL_TIMEOUT"] = "300"
+os.environ["TORCH_NCCL_USE_COMM_NONBLOCKING"] = "0"
+os.environ["NCCL_P2P_DISABLE"] = "1"
+os.environ["NCCL_SHM_DISABLE"] = "0"
+os.environ.setdefault("NCCL_SOCKET_IFNAME", "eth0,lo")
+os.environ.setdefault("NCCL_IB_DISABLE", "1")
+
 # Import ModelWithInsertedHiddenState - adjust path based on your project structure
 try:
-    from core_training.hidden_model.main_model import ModelWithInsertedHiddenState
+    from core_training.hidden_model.custom_model import ModelWithInsertedHiddenState
 except ImportError:
     try:
-        from ..core_training.hidden_model.main_model import ModelWithInsertedHiddenState
+        from ..core_training.hidden_model.custom_model import ModelWithInsertedHiddenState
     except ImportError:
         # Fallback for different project structures
         import sys
         import os
         sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'core_training', 'hidden_model'))
-        from main_model import ModelWithInsertedHiddenState
+        from custom_model import ModelWithInsertedHiddenState
 
 from callbacks import (
     PreCreateCkptDirCallback,
@@ -95,6 +115,50 @@ from callbacks import (
 IGNORE = -100
 EPS = 1e-8
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
+
+
+# =========================
+# Distributed training helpers
+# =========================
+def _get_local_rank() -> int:
+    """Determine local_rank from environment or command-line args."""
+    lr = int(os.environ.get("LOCAL_RANK", -1))
+    if lr == -1:
+        for arg in sys.argv:
+            if arg.startswith("--local_rank="):
+                lr = int(arg.split("=")[1])
+                break
+    return lr
+
+
+def _patch_eager_connect():
+    """
+    Monkey-patch PyTorch 2.4+ ProcessGroupNCCL to disable eager_connect_single_device.
+    In Docker containers, the eager NCCL connection causes 'CUDA device busy' errors.
+    """
+    try:
+        from torch.distributed import ProcessGroupNCCL
+        if hasattr(ProcessGroupNCCL, 'eager_connect_single_device'):
+            ProcessGroupNCCL.eager_connect_single_device = lambda self, device: None
+            rank0_print("[Patch] Disabled ProcessGroupNCCL.eager_connect_single_device")
+            return
+    except (ImportError, AttributeError):
+        pass
+
+    try:
+        import torch.distributed.distributed_c10d as c10d
+        _orig_helper = c10d._new_process_group_helper
+
+        def _patched_helper(*args, **kwargs):
+            pg, store = _orig_helper(*args, **kwargs)
+            if hasattr(pg, 'eager_connect_single_device'):
+                pg.eager_connect_single_device = lambda device: None
+            return pg, store
+
+        c10d._new_process_group_helper = _patched_helper
+        rank0_print("[Patch] Patched _new_process_group_helper to skip eager connect")
+    except Exception as e:
+        rank0_print(f"[Patch] Warning: could not patch eager connect: {e}")
 
 
 # =========================
@@ -535,8 +599,9 @@ class HiddenStateLoader:
     Load hidden_state/plan data from HF datasets.
     """
 
-    def __init__(self, dataset_name: str):
+    def __init__(self, dataset_name: str, task_ids: set = None):
         self.dataset_name = dataset_name
+        self.task_ids = task_ids
         self._load_data()
 
     def _load_data(self):
@@ -544,18 +609,22 @@ class HiddenStateLoader:
         ds = datasets.load_dataset(self.dataset_name, split=datasets.Split.TRAIN)
         rank0_print(f"Loaded {len(ds)} records.")
 
-        with tqdm(total=1, desc="Converting Dataset to Pandas") as pbar:
-            df = ds.to_pandas()
-            pbar.update(1)
-
+        # Iterate HF dataset directly — avoid to_pandas() which causes OOM
         id_to_data: Dict[str, Dict[str, Any]] = {}
         t0 = time.time()
-        for _, row in df.iterrows():
+        for row in tqdm(ds, desc="Building id_to_data"):
             task_id = row.get("task_id") or row.get("id")
+            if task_id is None:
+                continue
+
+            # Skip items not in the needed set
+            if self.task_ids is not None and str(task_id) not in self.task_ids:
+                continue
+
             hs = row.get("hidden_state", None)
             plan = row.get("plan", "")
 
-            if task_id is None or hs is None:
+            if hs is None:
                 continue
 
             if isinstance(hs, np.ndarray) and hs.dtype == object:
@@ -563,13 +632,19 @@ class HiddenStateLoader:
             else:
                 hs = np.array(hs, dtype=np.float32)
 
-            tensor = torch.from_numpy(hs)
+            tensor = torch.from_numpy(hs).to(torch.bfloat16)
             id_to_data[str(task_id)] = {
                 "hidden_state": tensor,
                 "plan": plan if isinstance(plan, str) else str(plan),
             }
 
+            # Early stop if we have all needed items
+            if self.task_ids is not None and len(id_to_data) >= len(self.task_ids):
+                rank0_print(f"[HiddenStateLoader] All {len(self.task_ids)} needed items loaded, stopping early.")
+                break
+
         rank0_print(f"Built id_to_data for {len(id_to_data)} items in {time.time() - t0:.2f}s")
+        del ds
         self.id_to_data = id_to_data
 
     def get_hidden_state_and_plan(self, task_id: str):
@@ -839,13 +914,20 @@ def make_supervised_data_module(
     conv_template_model_path: str,
     eval_ratio: float = 0.05,
     prepended_length: int = 128,
+    max_samples: int = 0,
 ) -> Dict[str, Any]:
     """
     Build data module.
     """
-    loader_train = HiddenStateLoader(hf_hidden_repo)
-
     train_json = json.load(open(data_path, "r"))
+    if max_samples > 0:
+        train_json = train_json[:max_samples]
+        rank0_print(f"[max_samples] Using only {len(train_json)} samples for quick testing.")
+
+    # Collect needed task_ids before loading hidden states
+    needed_ids = set(str(item["id"]) for item in train_json)
+    rank0_print(f"[data] Need hidden states for {len(needed_ids)} task_ids")
+    loader_train = HiddenStateLoader(hf_hidden_repo, task_ids=needed_ids)
 
     for item in train_json:
         merged_value = item["conversations"][0]["value"] + "\n" + item["conversations"][2]["value"]
@@ -918,6 +1000,8 @@ class Args:
     deepspeed: Optional[str] = field(default=None)
     gradient_checkpointing: bool = field(default=False)
 
+    max_samples: int = field(default=0)
+
     early_stopping_patience: int = field(default=5)
     early_stopping_threshold: float = field(default=0.0)
 
@@ -940,12 +1024,37 @@ def parse_args() -> Args:
 # Main
 # =========================
 def main():
+    # Patch out eager_connect_single_device before distributed init
+    _patch_eager_connect()
+
+    # Staggered CUDA init to avoid Docker CUDA driver race conditions
+    lr = _get_local_rank()
+    if lr >= 0 and torch.cuda.is_available():
+        if lr > 0:
+            time.sleep(lr * 2.0)
+        for attempt in range(5):
+            try:
+                torch.cuda.set_device(lr)
+                rank0_print(f"[Init] Rank {lr} bound to GPU {lr} ({torch.cuda.get_device_name(lr)})")
+                break
+            except RuntimeError as e:
+                if attempt < 4:
+                    wait = (attempt + 1) * 2
+                    print(f"[Init] Rank {lr} set_device failed (attempt {attempt+1}/5), "
+                          f"retrying in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    raise
+
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
 
     # Model path handling - Open source friendly approach
     # Use command line arguments or HuggingFace model names directly
@@ -1068,6 +1177,7 @@ def main():
         conv_template_model_path=args.conv_template_model_path,
         eval_ratio=0.05,
         prepended_length=args.K,
+        max_samples=args.max_samples,
     )
 
     # Show trainables
@@ -1145,7 +1255,7 @@ def main():
         deepspeed=args.deepspeed,
         gradient_checkpointing=args.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        dataloader_num_workers=8,
+        dataloader_num_workers=2,
         dataloader_pin_memory=True,
     )
 

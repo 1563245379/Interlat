@@ -18,6 +18,7 @@
 # This script trains compressed latent models using teacher-student distillation
 
 set -e  # Exit on error
+set -o pipefail
 
 # Colors for output
 RED='\033[0;31m'
@@ -25,6 +26,9 @@ GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
+
+# Set PYTHONPATH to include necessary modules
+export PYTHONPATH=$PYTHONPATH:$(pwd):$(pwd)/core_training:$(pwd)/compression_training
 
 print_step() {
     echo -e "${BLUE}[STEP $1]${NC} $2"
@@ -45,7 +49,7 @@ print_error() {
 # Default configurations
 STUDENT_MODEL="${STUDENT_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 TEACHER_MODEL="${TEACHER_MODEL:-./trained_models/teacher_model}"
-DATA_PATH="${DATA_PATH:-./data/alfworld_sft.json}"
+DATA_PATH="${DATA_PATH:-./data/training_data.json}"
 HIDDEN_REPO="${HIDDEN_REPO:-your_hidden_states_dataset}"
 OUTPUT_DIR="${OUTPUT_DIR:-./compressed_models}"
 K="${K:-128}"
