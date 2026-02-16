@@ -457,6 +457,25 @@ def finalize_data_save_and_merge(rank, world_size, output_dir="final_output", te
         print(f"Rank {rank} finished saving data.")
 
 
+def check_gpu_availability():
+    """检查GPU可用性和健康状态"""
+    if not torch.cuda.is_available():
+        return False, "CUDA not available"
+    
+    try:
+        gpu_count = torch.cuda.device_count()
+        if gpu_count == 0:
+            return False, "No CUDA devices found"
+        
+        # 尝试在GPU 0上分配一个小tensor测试
+        test_tensor = torch.zeros(1).cuda()
+        del test_tensor
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        return True, f"{gpu_count} GPU(s) available and healthy"
+    except RuntimeError as e:
+        return False, f"GPU test failed: {str(e)}"
+
 def setup_distributed(args):
     """Initialize distributed training environment"""
     print("Environment variables before setup:")
@@ -467,6 +486,14 @@ def setup_distributed(args):
     print(f"MASTER_PORT: {os.environ.get('MASTER_PORT', 'Not set')}")
     print(f"Hostname: {socket.gethostname()}")
 
+    # 检查GPU健康状态
+    gpu_available, gpu_status = check_gpu_availability()
+    print(f"GPU Status: {gpu_status}")
+    
+    if not gpu_available:
+        print("⚠️  WARNING: GPU not available, will use CPU mode")
+        return 0, 1, False  # rank, world_size, use_cuda
+    
     gpu_count = torch.cuda.device_count()
     print(f"Available GPU count: {gpu_count}")
 
@@ -500,7 +527,7 @@ def setup_distributed(args):
         world_size = 1
         print("Falling back to single-process mode")
 
-    return rank, world_size
+    return rank, world_size, gpu_available
 
 
 class MMDataset(Dataset):
@@ -930,7 +957,7 @@ def create_argument_parser():
         help="Batch size for data loading (DataLoader batch size)"
     )
     misc_group.add_argument(
-        "--inference_batch_size", type=int, default=4,
+        "--inference_batch_size", type=int, default=25,
         help="Batch size for model inference (推理时的批处理大小)"
     )
     misc_group.add_argument(
@@ -1007,15 +1034,16 @@ def main():
     print("=" * 50)
 
     # Initialize distributed environment
-    rank, world_size = setup_distributed(args)
-    print(f"After setup: Rank = {rank}, World Size = {world_size}")
+    rank, world_size, use_cuda = setup_distributed(args)
+    print(f"After setup: Rank = {rank}, World Size = {world_size}, Use CUDA = {use_cuda}")
 
     print(f"Running in {args.mode} mode with temperature={args.temperature}")
 
-    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
-    device = torch.device(f"cuda:{local_rank}")
-
-    model, tokenizer = load_model(args.model_path, local_rank, args.torch_dtype)
+    # 单进程模式下使用rank 0
+    local_rank = rank if world_size > 1 else 0
+    
+    model, tokenizer, device = load_model(args.model_path, local_rank, args.torch_dtype, use_cuda)
+    print(f"Using device: {device}")
 
     full_train_dataset = concatenate_datasets([
         load_dataset('EleutherAI/hendrycks_math', config, split=args.mode)

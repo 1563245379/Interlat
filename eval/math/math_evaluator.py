@@ -35,6 +35,8 @@ from datasets import load_dataset
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from core_training.hidden_model.custom_model import ModelWithInsertedHiddenState
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -143,7 +145,17 @@ class MathEvaluator:
                  device: str = "auto",
                  max_length: int = 2048,
                  temperature: float = 0.1,
-                 do_sample: bool = True):
+                 do_sample: bool = True,
+                 mode: str = "vanilla",
+                 hidden_data: Optional[str] = None,
+                 question_field: Optional[str] = None,
+                 solution_field: Optional[str] = None,
+                 plan_field: str = "plan",
+                 hidden_field: str = "hidden_state",
+                 task_id_field: str = "task_id",
+                 max_hidden_length: int = 800,
+                 insert_position: str = "auto",
+                 disable_mix: bool = False):
         """
         Initialize the evaluator
 
@@ -154,74 +166,241 @@ class MathEvaluator:
             max_length: Maximum generation length
             temperature: Sampling temperature
             do_sample: Whether to use sampling
+            mode: 'vanilla' (plain LM), 'hidden' (latent-aware), or 'plan' (plan text only)
+            hidden_data: Dataset name/path containing hidden states + plans for hidden/plan modes
+            question_field: Optional override for question field name
+            solution_field: Optional override for solution field name
+            plan_field: Field name storing plan text
+            hidden_field: Field name storing hidden states
+            task_id_field: Field name storing unique ids (for logging)
+            max_hidden_length: Truncate hidden states to this length
+            insert_position: 'auto' uses end of prompt tokens, or an integer index
+            disable_mix: Force-disable hidden/plan mixing inside the wrapper
         """
         self.model_name = model_name_or_path
         self.device = self._setup_device(device)
         self.max_length = max_length
         self.temperature = temperature
         self.do_sample = do_sample
+        self.mode = mode
+        self.hidden_data = hidden_data
+        self.question_field = question_field
+        self.solution_field = solution_field
+        self.plan_field = plan_field
+        self.hidden_field = hidden_field
+        self.task_id_field = task_id_field
+        self.max_hidden_length = max_hidden_length
+        self.insert_position = insert_position
+        self.disable_mix = disable_mix or (mode == "plan")
 
         logger.info(f"Loading model: {model_name_or_path}")
         logger.info(f"Using device: {self.device}")
+        logger.info(f"Eval mode: {self.mode}")
 
-        # Load tokenizer
-        tokenizer_name = tokenizer_name or model_name_or_path
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        # Load model
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
+        # Load tokenizer & model (wrapper-aware)
+        self.model, self.tokenizer = self._load_model_and_tokenizer(
+            model_name_or_path=model_name_or_path,
+            tokenizer_name=tokenizer_name or model_name_or_path,
             torch_dtype=torch.float16 if self.device != "cpu" else torch.float32,
-            device_map=self.device if device == "auto" else None,
-            trust_remote_code=True
         )
-
-        if device != "auto":
-            self.model = self.model.to(self.device)
 
         self.model.eval()
         self.answer_extractor = AnswerExtractor()
 
     def _setup_device(self, device: str) -> str:
-        """Setup computation device"""
+        """Setup computation device (resolves 'auto' -> 'cuda'|'cpu')."""
         if device == "auto":
-            if torch.cuda.is_available():
-                return "cuda"
-            else:
-                return "cpu"
+            return "cuda" if torch.cuda.is_available() else "cpu"
         return device
 
-    def create_prompt(self, question: str) -> str:
-        """
-        Create evaluation prompt for a math question
-        Override this method for different prompt formats
-        """
-        prompt = f"""Solve the following math problem step by step. Show your work clearly and put your final answer in \\boxed{{}}.
+    def _maybe_add_special_tokens(self, tokenizer):
+        """Ensure <bop>/<eop> exist for plan/hidden modes."""
+        if self.mode == "vanilla":
+            return tokenizer
 
-Problem: {question}
+        to_add = []
+        for tok in ["<bop>", "<eop>"]:
+            tid = tokenizer.convert_tokens_to_ids(tok)
+            if tid is None or tid == tokenizer.unk_token_id:
+                to_add.append(tok)
 
-Solution:"""
+        if to_add:
+            tokenizer.add_special_tokens({"additional_special_tokens": to_add})
+        return tokenizer
+
+    def _load_model_and_tokenizer(self, model_name_or_path: str, tokenizer_name: str, torch_dtype: torch.dtype):
+        """Load tokenizer and model; wrap with hidden-state module when available."""
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+        tokenizer.padding_side = "right"
+        tokenizer = self._maybe_add_special_tokens(tokenizer)
+
+        attn_impl = "flash_attention_2" if self.device.startswith("cuda") else None
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+            attn_implementation=attn_impl,
+            device_map=None,
+        )
+        base_model.to(self.device)
+
+        hidden_mha_path = os.path.join(model_name_or_path, "hidden_mha_state.pt")
+        prep_config_path = os.path.join(model_name_or_path, "prepended_config.json")
+
+        use_wrapper = self.mode in ("hidden", "plan") and os.path.exists(hidden_mha_path)
+        if not use_wrapper:
+            logger.info("Using base model (no hidden-state wrapper detected).")
+            return base_model, tokenizer
+
+        prep_conf = {
+            "prepended_length": 1000,
+            "hidden_size": getattr(base_model.config, "hidden_size", None),
+            "plan_similarity_weight": 0.0,
+            "random_contrast_weight": 0.0,
+        }
+        if os.path.exists(prep_config_path):
+            try:
+                with open(prep_config_path, "r") as f:
+                    prep_conf.update(json.load(f))
+            except Exception as e:
+                logger.warning(f"Failed to read prepended_config.json: {e}")
+
+        hidden_size = prep_conf.get("hidden_size") or getattr(base_model.config, "hidden_size", None)
+        model = ModelWithInsertedHiddenState(
+            base_model=base_model,
+            prepended_length=int(prep_conf.get("prepended_length", 1000)),
+            hidden_size=int(hidden_size),
+            prepended_learnable=bool(prep_conf.get("prepended_learnable", False)),
+            plan_similarity_weight=float(prep_conf.get("plan_similarity_weight", 0.0)),
+            random_contrast_weight=float(prep_conf.get("random_contrast_weight", 0.0)),
+            prepended_input_dim=prep_conf.get("hidden_size", hidden_size),
+        )
+
+        try:
+            state = torch.load(hidden_mha_path, map_location="cpu")
+            model.hidden_mha.load_state_dict(state["hidden_mha"])
+            model.pre_ln.load_state_dict(state["pre_ln"])
+            model.post_ln.load_state_dict(state["post_ln"])
+            if "adaptive_proj" in state:
+                model.adaptive_proj.load_state_dict(state["adaptive_proj"])
+            if "scale" in state and hasattr(model, "scale"):
+                with torch.no_grad():
+                    model.scale.fill_(float(state["scale"]))
+            if "output_scale" in state and hasattr(model, "output_scale"):
+                with torch.no_grad():
+                    model.output_scale.fill_(float(state["output_scale"]))
+            logger.info("Loaded hidden-state wrapper weights from hidden_mha_state.pt")
+        except Exception as e:
+            logger.warning(f"Failed to load hidden-state weights, using base model: {e}")
+            return base_model, tokenizer
+
+        model.tokenizer = tokenizer
+        model.to(self.device)
+        return model, tokenizer
+
+    def _resolve_fields(self, dataset) -> Tuple[str, str]:
+        """Resolve question/solution field names with sensible fallbacks."""
+        columns = set(dataset.column_names)
+        q_field = self.question_field or ("task" if "task" in columns else "problem")
+        s_field = self.solution_field or ("task_solution" if "task_solution" in columns else "solution")
+        if q_field not in columns:
+            raise KeyError(f"Question field '{q_field}' not found in dataset columns {columns}")
+        if s_field not in columns:
+            logger.warning(f"Solution field '{s_field}' missing; accuracy will be zero.")
+        return q_field, s_field
+
+    def _load_eval_dataset(self, dataset_name: str, split: str, num_samples: int = None):
+        """Load evaluation dataset; switch to hidden_data when requested."""
+        target = self.hidden_data if self.mode in ("hidden", "plan") and self.hidden_data else dataset_name
+        logger.info(f"Loading dataset: {target} ({split})")
+        dataset = load_dataset(target, split=split)
+        if num_samples:
+            dataset = dataset.select(range(min(num_samples, len(dataset))))
+        return dataset
+
+    def _compute_insert_pos(self, attention_mask: torch.Tensor) -> int:
+        """Compute insertion index based on non-pad tokens or a fixed override."""
+        if isinstance(self.insert_position, str) and self.insert_position != "auto":
+            try:
+                return int(self.insert_position)
+            except ValueError:
+                logger.warning(f"Invalid insert_position={self.insert_position}, falling back to auto")
+        if not isinstance(attention_mask, torch.Tensor):
+            return 0
+        return int(attention_mask[0].sum().item())
+
+    def _prepare_generation_kwargs(self, prompt: str, plan_text: Optional[str], hidden_state: Optional[Any]):
+        """Prepare inputs/model kwargs for different modes."""
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.max_length)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        if self.mode == "vanilla":
+            return inputs, {}
+
+        human_pos = self._compute_insert_pos(inputs.get("attention_mask"))
+        plan_ids = self.tokenizer(plan_text or "", add_special_tokens=False).input_ids
+
+        model_kwargs: Dict[str, Any] = {
+            "plans": [plan_ids],
+            "human_end_positions": torch.tensor([human_pos], device=self.device),
+            "disable_mix": self.disable_mix,
+        }
+
+        if self.mode == "hidden" and hidden_state is not None:
+            hs = torch.tensor(hidden_state)
+            if hs.dim() == 3 and hs.size(0) == 1:
+                hs = hs.squeeze(0)
+            if self.max_hidden_length and hs.size(0) > self.max_hidden_length:
+                hs = hs[:self.max_hidden_length]
+            hs = hs.to(self.device, dtype=self.model.get_input_embeddings().weight.dtype)
+            model_kwargs["prepended_hidden_states"] = [hs]
+        else:
+            model_kwargs["prepended_hidden_states"] = None
+
+        return inputs, model_kwargs
+
+    def create_prompt(self, question: str, plan_text: Optional[str] = None) -> str:
+        """Create evaluation prompt; optionally include plan text."""
+        if plan_text and self.mode in ("hidden", "plan"):
+            prompt = (
+                "Solve the following math problem step by step. "
+                "A high-level plan is provided; follow it but verify each step. "
+                "Provide the final answer in \\boxed{} .\n\n"
+                f"Plan:\n{plan_text}\n\n"
+                f"Problem: {question}\n\n"
+                "Solution:"
+            )
+        else:
+            prompt = (
+                "Solve the following math problem step by step. "
+                "Show your work clearly and put your final answer in \\boxed{} .\n\n"
+                f"Problem: {question}\n\n"
+                "Solution:"
+            )
         return prompt
 
-    def generate_response(self, prompt: str) -> str:
-        """Generate model response for a given prompt"""
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True)
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+    def generate_response(self, prompt: str, plan_text: Optional[str] = None, hidden_state: Optional[Any] = None) -> str:
+        """Generate model response with optional plan/hidden inputs."""
+        inputs, model_kwargs = self._prepare_generation_kwargs(prompt, plan_text, hidden_state)
 
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
+                **model_kwargs,
                 max_new_tokens=self.max_length,
                 temperature=self.temperature,
                 do_sample=self.do_sample,
                 pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
+                eos_token_id=self.tokenizer.eos_token_id,
             )
 
         # Decode response (remove input prompt)
-        response = self.tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        response = self.tokenizer.decode(
+            outputs[0][inputs["input_ids"].shape[1]:],
+            skip_special_tokens=True,
+        )
         return response.strip()
 
     def evaluate_dataset(self,
@@ -243,16 +422,14 @@ Solution:"""
         Returns:
             Dictionary containing evaluation results
         """
-        logger.info(f"Loading dataset: {dataset_name}")
-
+        target_dataset = self.hidden_data if self.mode in ("hidden", "plan") and self.hidden_data else dataset_name
         try:
-            dataset = load_dataset(dataset_name, split=split)
+            dataset = self._load_eval_dataset(target_dataset, split, num_samples)
         except Exception as e:
             logger.error(f"Failed to load dataset: {e}")
             raise
 
-        if num_samples:
-            dataset = dataset.select(range(min(num_samples, len(dataset))))
+        q_field, s_field = self._resolve_fields(dataset)
 
         logger.info(f"Evaluating {len(dataset)} questions with {samples_per_question} samples each")
 
@@ -267,16 +444,24 @@ Solution:"""
         pbar = tqdm(total=len(dataset) * samples_per_question, desc="Evaluating")
 
         for idx, item in enumerate(dataset):
-            question = item["problem"]
-            ground_truth = item["solution"]
+            question = item[q_field]
+            ground_truth = item.get(s_field, "") or ""
+            plan_text = item.get(self.plan_field, "") if self.mode in ("hidden", "plan") else ""
+            hidden_state = item.get(self.hidden_field, None) if self.mode == "hidden" else None
+            question_id = str(item.get(self.task_id_field, idx))
+
+            if self.mode == "hidden" and hidden_state is None:
+                logger.warning(f"[Skip] No hidden_state for sample {question_id}, skipping.")
+                pbar.update(samples_per_question)
+                continue
 
             question_results = []
 
             for sample_id in range(samples_per_question):
                 try:
                     # Generate response
-                    prompt = self.create_prompt(question)
-                    response = self.generate_response(prompt)
+                    prompt = self.create_prompt(question, plan_text)
+                    response = self.generate_response(prompt, plan_text, hidden_state)
 
                     # Evaluate answer
                     is_correct, pred_answer, norm_gt = self.answer_extractor.evaluate_answer(
@@ -285,7 +470,7 @@ Solution:"""
 
                     # Create result record
                     result = EvaluationResult(
-                        question_id=f"{idx}_{sample_id}",
+                        question_id=f"{question_id}_{sample_id}",
                         question=question,
                         model_output=response,
                         predicted_answer=pred_answer,
@@ -322,14 +507,15 @@ Solution:"""
 
         eval_summary = {
             "model_name": self.model_name,
-            "dataset": dataset_name,
+            "dataset": target_dataset,
             "split": split,
             "total_questions": len(dataset),
             "samples_per_question": samples_per_question,
             "total_samples": total_count,
             "correct_samples": correct_count,
             "accuracy": accuracy,
-            "evaluation_time": datetime.now().isoformat()
+            "evaluation_time": datetime.now().isoformat(),
+            "mode": self.mode,
         }
 
         # Save results
@@ -375,6 +561,29 @@ def main():
     parser.add_argument("--do_sample", action="store_true",
                        help="Use sampling for generation")
 
+    # Plan / hidden-state options
+    parser.add_argument("--mode", type=str, default="vanilla",
+                        choices=["vanilla", "hidden", "plan"],
+                        help="Evaluation mode: vanilla LM, hidden-state receiver, or plan-text input")
+    parser.add_argument("--hidden_data", type=str, default=None,
+                        help="Dataset containing plan/hidden_state fields (HF name or local path)")
+    parser.add_argument("--question_field", type=str, default=None,
+                        help="Override question field name")
+    parser.add_argument("--solution_field", type=str, default=None,
+                        help="Override solution field name")
+    parser.add_argument("--plan_field", type=str, default="plan",
+                        help="Field name for plan text")
+    parser.add_argument("--hidden_field", type=str, default="hidden_state",
+                        help="Field name for hidden states")
+    parser.add_argument("--task_id_field", type=str, default="task_id",
+                        help="Field name for sample id (used in logs)")
+    parser.add_argument("--max_hidden_length", type=int, default=800,
+                        help="Truncate hidden states to this length")
+    parser.add_argument("--insert_position", type=str, default="auto",
+                        help="Insert position for plan/hidden (auto=after prompt tokens or integer index)")
+    parser.add_argument("--disable_mix", action="store_true",
+                        help="Disable mixing hidden states with plan embeddings inside wrapper")
+
     # Evaluation arguments
     parser.add_argument("--dataset", type=str, default="hendrycks/MATH",
                        help="Dataset to evaluate on")
@@ -396,7 +605,17 @@ def main():
         device=args.device,
         max_length=args.max_length,
         temperature=args.temperature,
-        do_sample=args.do_sample
+        do_sample=args.do_sample,
+        mode=args.mode,
+        hidden_data=args.hidden_data,
+        question_field=args.question_field,
+        solution_field=args.solution_field,
+        plan_field=args.plan_field,
+        hidden_field=args.hidden_field,
+        task_id_field=args.task_id_field,
+        max_hidden_length=args.max_hidden_length,
+        insert_position=args.insert_position,
+        disable_mix=args.disable_mix,
     )
 
     # Run evaluation
